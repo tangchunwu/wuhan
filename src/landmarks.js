@@ -46,6 +46,7 @@ export const SPIRE_HEIGHT = 2.6;
 export const SPIRE_BASE_RADIUS = 0.42; // base width 0.84; height 2.6 >= 2*0.84 (Req 2.1)
 export const SPIRE_TAPER = 0.62;
 export const BRIDGE_GOLD_FRACTION = 0.62; // > 0.5 gold (Req 1.6)
+export const RIPPLE_RING_SEGMENTS = 64; // segments per ripple line loop
 
 // ---------------------------------------------------------------------------
 // Pure geometry helpers (stubs — implemented in tasks 2.x)
@@ -158,28 +159,295 @@ export function densifyPolyline(points, count, jitter, rand) {
   return out;
 }
 
-// Produce a vertically mirrored copy across a waterline:
-// y' = waterY - (y - waterY) * factor; x/z unchanged. Implemented in task 2.5.
+// Produce a vertically mirrored copy across a waterline.
+//
+// - `positions`: a Float32Array of length N*3 (x,y,z per point).
+// - `waterY`: the waterline height the geometry is mirrored across.
+// - `factor`: vertical compression of the reflection; defaults to
+//   REFLECTION_COMPRESS when undefined.
+//
+// Returns a NEW Float32Array of the same length where each point's x and z are
+// preserved and y is mapped to: y' = waterY - (y - waterY) * factor. Because
+// factor is in (0, 1], every reflection of an above-water point (y > waterY)
+// lands at or below the waterline, producing a vertical mirror below it.
+//
+// Degenerate input is guarded: empty/null `positions` returns Float32Array(0);
+// non-finite inputs (positions, waterY, factor) are sanitized to safe finite
+// values so the output never contains NaN.
 export function mirrorAcrossWaterline(positions, waterY, factor) {
-  return new Float32Array(0);
+  if (!positions || positions.length === 0) {
+    return new Float32Array(0);
+  }
+
+  const safeWaterY = Number.isFinite(waterY) ? waterY : 0;
+  // factor defaults to REFLECTION_COMPRESS when undefined; any non-finite value
+  // also falls back to the default so we never emit NaN.
+  const safeFactor = Number.isFinite(factor) ? factor : REFLECTION_COMPRESS;
+
+  const out = new Float32Array(positions.length);
+  for (let i = 0; i + 2 < positions.length; i += 3) {
+    const x = positions[i];
+    const y = positions[i + 1];
+    const z = positions[i + 2];
+    out[i] = Number.isFinite(x) ? x : 0;
+    const safeY = Number.isFinite(y) ? y : safeWaterY;
+    out[i + 1] = safeWaterY - (safeY - safeWaterY) * safeFactor;
+    out[i + 2] = Number.isFinite(z) ? z : 0;
+  }
+  return out;
 }
 
 // Return the attenuated reflection opacity (ratio * sourceOpacity).
-// Implemented in task 2.5.
+//
+// The `ratio` is expected to be in [0.2, 0.5] (callers pass the fixed
+// BRIDGE_REFLECTION_OPACITY_RATIO / PAVILION_REFLECTION_OPACITY_RATIO
+// constants). The ratio itself is not clamped here — it is simply multiplied —
+// but non-finite inputs are guarded by returning 0 so the result is never NaN.
 export function reflectionOpacity(sourceOpacity, ratio) {
-  return undefined;
+  if (!Number.isFinite(sourceOpacity) || !Number.isFinite(ratio)) {
+    return 0;
+  }
+  return ratio * sourceOpacity;
 }
 
 // Build a triangulated polygon web as a THREE.LineSegments with
-// userData.segmentCount. Implemented in task 2.8.
+// userData.segmentCount.
+//
+// - `maskFn(cx, cy)`: returns true when the lattice cell whose centroid is at
+//   (cx, cy) should be kept. Defaults to a permissive full-pass mask when not a
+//   function. Exceptions thrown by the mask are treated as "reject".
+// - `bounds`: `{ minX, maxX, minY, maxY }` describing the 2D plane the lattice
+//   covers. Points are placed at z = `bounds.z` (or 0 when absent), i.e. a
+//   constant plane. Non-finite / degenerate bounds are sanitized to a
+//   non-degenerate rectangle so every emitted triangle has three distinct
+//   vertices.
+// - `cols`, `rows`: lattice vertex resolution (>= 2 each). Defaulted when not
+//   provided, and increased automatically so the emitted segment count never
+//   drops below `BRIDGE_MESH_SEGMENT_COUNT`.
+// - `color`: a THREE.Color / hex / CSS string applied to every vertex via the
+//   `color` attribute (vertexColors). Defaults to white on invalid input.
+// - `opacity`: line material opacity (defaults to 1 on non-finite input).
+//
+// Lays a `cols x rows` lattice of vertices over the bounds. For each cell the
+// centroid is computed; if `maskFn(centroid)` passes, the quad is split into two
+// triangles and each triangle's three undirected edges are emitted as closed
+// line segments (a 3-cycle: A-B, B-C, C-A), so every triangle is closed with no
+// dangling endpoint. Returns a THREE.LineSegments (additive, depthWrite:false,
+// transparent) with `userData.segmentCount` set to the number of emitted
+// segments, guaranteed `>= BRIDGE_MESH_SEGMENT_COUNT`.
 export function buildLatticeMeshOverlay(maskFn, bounds, cols, rows, color, opacity) {
-  return undefined;
+  // --- Sanitize bounds into a non-degenerate plane rectangle. ---
+  const b = bounds && typeof bounds === 'object' ? bounds : {};
+  let minX = Number.isFinite(b.minX) ? b.minX : -1;
+  let maxX = Number.isFinite(b.maxX) ? b.maxX : 1;
+  let minY = Number.isFinite(b.minY) ? b.minY : -1;
+  let maxY = Number.isFinite(b.maxY) ? b.maxY : 1;
+  // Guarantee positive width/height so each cell yields three distinct vertices.
+  if (!(maxX > minX)) maxX = minX + 1;
+  if (!(maxY > minY)) maxY = minY + 1;
+  const planeZ = Number.isFinite(b.z) ? b.z : 0;
+
+  // --- Sanitize mask, opacity, and lattice resolution. ---
+  const mask = typeof maskFn === 'function' ? maskFn : () => true;
+  const opacityVal = Number.isFinite(opacity) ? opacity : 1;
+
+  const DEFAULT_COLS = 24; // wide lattice (the bridge spans horizontally)
+  const DEFAULT_ROWS = 10;
+  const MAX_RES = 512; // safety clamp against pathological inputs
+  // A lattice needs >= 2 vertices per axis to form at least one cell.
+  let effCols = Number.isFinite(cols) && cols >= 2 ? Math.min(MAX_RES, Math.floor(cols)) : DEFAULT_COLS;
+  let effRows = Number.isFinite(rows) && rows >= 2 ? Math.min(MAX_RES, Math.floor(rows)) : DEFAULT_ROWS;
+
+  const FLOOR = BRIDGE_MESH_SEGMENT_COUNT; // >= 200 closed-triangle segments
+
+  // Collect triangle edges for a given mask + lattice resolution. Returns a
+  // plain number[] of (x,y,z) pairs (two vertices per segment); each triangle's
+  // three edges are emitted consecutively as a closed loop.
+  const collect = (testFn, nCols, nRows) => {
+    const verts = [];
+    const xAt = (i) => minX + ((maxX - minX) * i) / (nCols - 1);
+    const yAt = (j) => minY + ((maxY - minY) * j) / (nRows - 1);
+    const pushEdge = (ax, ay, bx, by) => {
+      verts.push(ax, ay, planeZ, bx, by, planeZ);
+    };
+    for (let i = 0; i < nCols - 1; i++) {
+      const x0 = xAt(i);
+      const x1 = xAt(i + 1);
+      for (let j = 0; j < nRows - 1; j++) {
+        const y0 = yAt(j);
+        const y1 = yAt(j + 1);
+        const cx = (x0 + x1) * 0.5;
+        const cy = (y0 + y1) * 0.5;
+        let keep;
+        try {
+          keep = !!testFn(cx, cy);
+        } catch {
+          keep = false;
+        }
+        if (!keep) continue;
+        // Quad corners: (x0,y0)=A (x1,y0)=B (x1,y1)=C (x0,y1)=D.
+        // Triangle 1: A-B-C (closed 3-cycle of edges).
+        pushEdge(x0, y0, x1, y0);
+        pushEdge(x1, y0, x1, y1);
+        pushEdge(x1, y1, x0, y0);
+        // Triangle 2: A-C-D (closed 3-cycle of edges).
+        pushEdge(x0, y0, x1, y1);
+        pushEdge(x1, y1, x0, y1);
+        pushEdge(x0, y1, x0, y0);
+      }
+    }
+    return verts;
+  };
+
+  const segCount = (verts) => verts.length / 6;
+
+  // 1) Build with the provided mask at the requested/default resolution.
+  let verts = collect(mask, effCols, effRows);
+
+  // 2) If under the floor, grow the lattice (preserving aspect ratio) so a
+  //    sparse-but-nonzero mask keeps enough cells to clear the floor. Bounded
+  //    to a handful of attempts so a reject-everything mask can't spin forever.
+  let growAttempts = 0;
+  while (segCount(verts) < FLOOR && growAttempts < 6) {
+    effCols = Math.min(MAX_RES, Math.ceil(effCols * 1.5));
+    effRows = Math.min(MAX_RES, Math.ceil(effRows * 1.5));
+    verts = collect(mask, effCols, effRows);
+    growAttempts++;
+  }
+
+  // 3) If still under the floor (e.g. the mask rejects everything), fall back to
+  //    a permissive full-pass mask on a modest lattice that guarantees >= FLOOR.
+  if (segCount(verts) < FLOOR) {
+    let fbCols = DEFAULT_COLS;
+    let fbRows = DEFAULT_ROWS;
+    verts = collect(() => true, fbCols, fbRows);
+    while (segCount(verts) < FLOOR) {
+      fbCols = Math.min(MAX_RES, Math.ceil(fbCols * 1.5));
+      fbRows = Math.min(MAX_RES, Math.ceil(fbRows * 1.5));
+      verts = collect(() => true, fbCols, fbRows);
+    }
+  }
+
+  // --- Build geometry + colored, additive line material. ---
+  const positions = new Float32Array(verts);
+  let lineColor;
+  try {
+    lineColor = new THREE.Color(color === undefined || color === null ? 0xffffff : color);
+  } catch {
+    lineColor = new THREE.Color(0xffffff);
+  }
+  const vertexCount = positions.length / 3;
+  const colors = new Float32Array(vertexCount * 3);
+  for (let v = 0; v < vertexCount; v++) {
+    colors[v * 3] = lineColor.r;
+    colors[v * 3 + 1] = lineColor.g;
+    colors[v * 3 + 2] = lineColor.b;
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const material = new THREE.LineBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: opacityVal,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+
+  const lines = new THREE.LineSegments(geometry, material);
+  lines.userData.segmentCount = positions.length / 6;
+  return lines;
 }
 
-// Build `ringCount` horizontal ellipse line loops centered on a waterline for
-// ripple effects. Implemented in task 2.10.
+// Build `ringCount` horizontal ellipse line loops sharing a common center on a
+// waterline, for ripple effects on the lake surface.
+//
+// - `center`: `{ x, y, z }` lake-surface center; `center.y` is the waterline
+//   height every ring sits at.
+// - `ringCount`: number of concentric rings to build (must be >= 1).
+// - `baseRadius`: radius of the innermost ring (ring 0).
+// - `step`: radius increment per ring, so ring `i` has
+//   `radius = baseRadius + i * step`. Radii are therefore STRICTLY INCREASING.
+// - `color`: a THREE.Color / hex / CSS string applied to every ring's material.
+//
+// Each ring is a flat horizontal loop in the XZ plane at `y = center.y` (a
+// ripple lying on the water surface), built as a `THREE.LineLoop` from a
+// circle of `RIPPLE_RING_SEGMENTS` segments so all rings share the exact same
+// center. Each ring's material is a `THREE.LineBasicMaterial` with
+// `transparent: true`, `AdditiveBlending`, and `depthWrite: false`, and each
+// ring carries `userData.baseOpacity` (decreasing slightly with radius) plus
+// `userData.radius` so the animation loop can fade/animate them.
+//
+// Returns an ARRAY of `THREE.Line` (`LineLoop`) objects of length `ringCount`.
+//
+// Guards: `ringCount < 1` or non-finite returns `[]`. Non-finite
+// `center` / `baseRadius` / `step` are sanitized to safe finite, positive
+// values, and `step` is floored to a tiny positive value so radii stay strictly
+// increasing. The output never contains NaN.
 export function buildRippleRings(center, ringCount, baseRadius, step, color) {
-  return [];
+  // Guard ring count: must be a finite integer >= 1.
+  const count = Number.isFinite(ringCount) ? Math.floor(ringCount) : 0;
+  if (count < 1) {
+    return [];
+  }
+
+  // Sanitize the shared center to finite values (defaults to the origin).
+  const c = center && typeof center === 'object' ? center : {};
+  const cx = Number.isFinite(c.x) ? c.x : 0;
+  const cy = Number.isFinite(c.y) ? c.y : 0;
+  const cz = Number.isFinite(c.z) ? c.z : 0;
+
+  // Sanitize radii. baseRadius must be positive so ring 0 is a real loop, and
+  // step must be strictly positive so radii are strictly increasing.
+  const safeBaseRadius = Number.isFinite(baseRadius) && baseRadius > 0 ? baseRadius : 0.5;
+  const safeStep = Number.isFinite(step) && step > 0 ? step : 0.3;
+
+  // Resolve the shared ring color once (fallback to white on invalid input).
+  let ringColor;
+  try {
+    ringColor = new THREE.Color(color === undefined || color === null ? 0xffffff : color);
+  } catch {
+    ringColor = new THREE.Color(0xffffff);
+  }
+
+  const SEGMENTS = RIPPLE_RING_SEGMENTS;
+  const rings = [];
+
+  for (let i = 0; i < count; i++) {
+    const radius = safeBaseRadius + i * safeStep;
+
+    // Flat horizontal loop in the XZ plane at the waterline (y = center.y).
+    const positions = new Float32Array(SEGMENTS * 3);
+    for (let s = 0; s < SEGMENTS; s++) {
+      const angle = (s / SEGMENTS) * Math.PI * 2;
+      positions[s * 3] = cx + Math.cos(angle) * radius;
+      positions[s * 3 + 1] = cy;
+      positions[s * 3 + 2] = cz + Math.sin(angle) * radius;
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+    const material = new THREE.LineBasicMaterial({
+      color: ringColor.clone(),
+      transparent: true,
+      opacity: 1,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+
+    // Closed loop (LineLoop extends THREE.Line) so the ring needs no duplicate
+    // closing vertex.
+    const ring = new THREE.LineLoop(geometry, material);
+    // Opacity decreases slightly with radius so outer ripples read fainter.
+    ring.userData.baseOpacity = Math.max(0.08, 0.5 - i * 0.08);
+    ring.userData.radius = radius;
+    rings.push(ring);
+  }
+
+  return rings;
 }
 
 // Wrap a ShaderMaterial point cloud (depth-attenuated gl_PointSize, uOpacity,
